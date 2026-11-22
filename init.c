@@ -18,6 +18,7 @@
 #include <sys/reboot.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <ctype.h>
 
 volatile sig_atomic_t current_runlevel = 3; 
 volatile sig_atomic_t child_died = 0;
@@ -28,6 +29,22 @@ struct timespec boot_start;
 /* массив пидов для консолей */
 pid_t shell_pids[2] = {0, 0};
 const char *tty_names[2] = {"tty1", "tty2"};
+
+/* Нативный менеджер сервисов: S##/D## (start), K## (stop), <name>.levels */
+#define MAX_SERVICES 32
+struct service {
+    char name[48];
+    char start_path[192];
+    char stop_path[192];
+    int levels;      /* битовая маска: бит n = runlevel n */
+    int order;
+    int daemon;      /* D## — долгоживущий, не ждём завершения */
+    int active;
+    int last_status; /* код возврата последнего запуска, -1 = не запускался */
+    pid_t pid;       /* 0 для oneshot-сервисов */
+};
+static struct service services[MAX_SERVICES];
+static int service_count = 0;
 
 static void setup_signals(void);
 static void do_log(const char *fmt, ...);
@@ -44,6 +61,14 @@ static void load_kernel_modules(void);
 static void clear_screen(void);
 static void print_banner(void);
 static void run_init_scripts(void);
+static void discover_services(void);
+static struct service *find_service(const char *name);
+static void start_service(struct service *svc);
+static void stop_service(struct service *svc);
+static void stop_all_services(void);
+static void run_services(int runlevel);
+static void set_runlevel(int level);
+static void handle_service_command(const char *cmd);
 static pid_t spawn_shell(const char *tty);
 static void emergency_shell(void);
 static void graceful_shutdown(void);
@@ -58,6 +83,7 @@ static void create_standard_dirs(void);
 
 static int telinit_main(int argc, char *argv[]);
 static int instatus_main(int argc, char *argv[]);
+static int in_service_main(int argc, char *argv[]);
 
 static void install_own_symlinks(void) {
     char exe_path[256];
@@ -76,6 +102,9 @@ static void install_own_symlinks(void) {
     if (symlink(exe_path, "/usr/bin/in-status") != 0 && errno != EEXIST) {
         do_log("warning: cannot create /usr/bin/in-status: %s\n", strerror(errno));
     }
+    if (symlink(exe_path, "/usr/bin/in-service") != 0 && errno != EEXIST) {
+        do_log("warning: cannot create /usr/bin/in-service: %s\n", strerror(errno));
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -84,6 +113,7 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(progname, "telinit") == 0) return telinit_main(argc, argv);
     if (strcmp(progname, "in-status") == 0) return instatus_main(argc, argv);
+    if (strcmp(progname, "in-service") == 0) return in_service_main(argc, argv);
 
     if (getpid() != 1) {
         fprintf(stderr, "error: init must be run as PID 1\n");
@@ -127,7 +157,7 @@ int main(int argc, char *argv[]) {
     create_standard_dirs();
 
     do_log("================================\n");
-    do_log("init started. wilix oneinit v0.9\n");
+    do_log("init started. COMBINE oneinit v0.9\n");
 
     /* пишем пид init в файл */
     write_pid_file("init", getpid());
@@ -185,6 +215,8 @@ int main(int argc, char *argv[]) {
     do_log("entering main init loop. runlevel = %d\n", current_runlevel);
 
     int fifo_fd = open("/run/initctl", O_RDWR | O_NONBLOCK);
+    char cmd_buf[128];
+    int cmd_len = 0;
 
     /* главный цикл */
     while (!shutdown_requested) {
@@ -207,17 +239,18 @@ int main(int argc, char *argv[]) {
         int retval = select((fifo_fd >= 0 ? fifo_fd + 1 : 0), &rfds, NULL, NULL, &tv);
 
         if (retval > 0 && fifo_fd >= 0 && FD_ISSET(fifo_fd, &rfds)) {
-            char cmd;
-            if (read(fifo_fd, &cmd, 1) == 1) {
-                if (cmd >= '0' && cmd <= '6') {
-                    current_runlevel = cmd - '0';
-                    update_status_file();
-                    if (current_runlevel == 0 || current_runlevel == 6) shutdown_requested = 1;
-                    else if (current_runlevel == 1) {
-                        kill(-1, SIGTERM);
-                        emergency_shell();
-                        shutdown_requested = 1; 
-                    }
+            char c;
+            if (read(fifo_fd, &c, 1) == 1) {
+                if (cmd_len == 0 && c >= '0' && c <= '6') {
+                    set_runlevel(c - '0');
+                } else if (c == '\n') {
+                    cmd_buf[cmd_len] = '\0';
+                    handle_service_command(cmd_buf);
+                    cmd_len = 0;
+                } else if (cmd_len < (int)sizeof(cmd_buf) - 1) {
+                    cmd_buf[cmd_len++] = c;
+                } else {
+                    cmd_len = 0; /* сброс битых команд */
                 }
             }
         }
@@ -229,6 +262,16 @@ int main(int argc, char *argv[]) {
             while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
                 for (int i = 0; i < 2; i++) {
                     if (p == shell_pids[i]) shell_pids[i] = 0; 
+                }
+                for (int j = 0; j < service_count; j++) {
+                    if (services[j].pid == p) {
+                        char path[128];
+                        snprintf(path, sizeof(path), "/run/%.100s.pid", services[j].name);
+                        unlink(path);
+                        services[j].pid = 0;
+                        services[j].active = 0;
+                        do_log("service %s exited unexpectedly\n", services[j].name);
+                    }
                 }
             }
         }
@@ -254,13 +297,46 @@ static int telinit_main(int argc, char *argv[]) {
 
 static int instatus_main(int argc, char *argv[]) {
     (void)argc; (void)argv;
-    printf("\033[1;36m=== wilix v0.9 init status ===\033[0m\n");
+    printf("\033[1;36m=== COMBINE v0.9 init status ===\033[0m\n");
     FILE *f = fopen("/run/init_status", "r");
     if (!f) return 1;
     char line[256];
     while(fgets(line, sizeof(line), f)) printf("%s", line);
     fclose(f);
     printf("\033[1;36m==============================\033[0m\n");
+    return 0;
+}
+
+static int in_service_main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("usage: in-service <start|stop|restart|list> [service]\n");
+        return 1;
+    }
+    int fd = open("/run/initctl", O_WRONLY);
+    if (fd < 0) {
+        perror("in-service: /run/initctl");
+        return 1;
+    }
+    char cmd[128];
+    if (argc >= 3) snprintf(cmd, sizeof(cmd), "%s %s\n", argv[1], argv[2]);
+    else snprintf(cmd, sizeof(cmd), "%s\n", argv[1]);
+    if (write(fd, cmd, strlen(cmd)) < 0) {
+        perror("in-service: write");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    usleep(200000); /* даём init время обновить /run/init_status */
+
+    FILE *f = fopen("/run/init_status", "r");
+    if (!f) return 1;
+    char line[256];
+    int in_services = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Services:", 9) == 0) in_services = 1;
+        if (in_services) printf("%s", line);
+    }
+    fclose(f);
     return 0;
 }
 
@@ -303,58 +379,249 @@ static void clear_screen(void) {
 
 static void print_banner(void) {
     printf("\033[0;34m========\033[1;34m========\033[0;36m========\033[1;36m================\033[0m\n\n");
-    printf("\033[1;36m  wilix v0.9 \033[1;30m//\033[1;36m oneinit v0.9\033[0m\n\n");
+    printf("\033[1;36m  COMBINE v0.9 \033[1;30m//\033[1;36m oneinit v0.9\033[0m\n\n");
+    printf("\033[1;37m  C O M B I N E   L i n u x\033[0m\n");
+    printf("\033[1;30m  glibc + GNU coreutils\033[0m\n\n");
     printf("  welcome!\n");
     printf("\033[0;34m========\033[1;34m========\033[0;36m========\033[1;36m================\033[0m\n\n");
 }
 
-static void run_init_scripts(void) {
-    struct dirent **namelist;
-    int n;
+static int cmp_service(const void *a, const void *b) {
+    const struct service *sa = a, *sb = b;
+    return sa->order - sb->order;
+}
 
-    if (access("/etc/init.d", F_OK) != 0) return;
+/* Имя сервиса и порядок берём из имени файла: S20-network, D50-x11, K50-x11 */
+static const char *service_name_from_file(const char *file, int *order, int *daemon) {
+    const char *p = file;
+    *daemon = 0;
+    *order = 0;
+    if (*p == 'S' || *p == 'D' || *p == 'K') {
+        *daemon = (*p == 'D');
+        p++;
+    }
+    while (isdigit((unsigned char)*p)) {
+        *order = *order * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '-' || *p == '.') p++;
+    return p;
+}
 
-    n = scandir("/etc/init.d", &namelist, NULL, alphasort);
-    if (n < 0) return;
+static struct service *find_service(const char *name) {
+    for (int i = 0; i < service_count; i++) {
+        if (strcmp(services[i].name, name) == 0) return &services[i];
+    }
+    return NULL;
+}
 
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < n; i++) {
-            int is_S = (namelist[i]->d_name[0] == 'S');
-            if ((pass == 0 && !is_S) || (pass == 1 && (is_S || namelist[i]->d_name[0] == '.'))) {
-                continue;
+static void discover_services(void) {
+    DIR *d = opendir("/etc/init.d");
+    if (!d) return;
+    struct dirent *de;
+
+    /* стартовые скрипты */
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        if (n[0] == '.' || n[0] == 'K') continue;
+        if (!(n[0] == 'S' || n[0] == 'D' || isdigit((unsigned char)n[0]))) continue;
+
+        int order = 0, daemon = 0;
+        const char *name = service_name_from_file(n, &order, &daemon);
+        if (!*name) continue;
+
+        char path[512];
+        snprintf(path, sizeof(path), "/etc/init.d/%s", n);
+        if (access(path, X_OK) != 0) continue;
+
+        struct service *svc = find_service(name);
+        if (!svc) {
+            if (service_count >= MAX_SERVICES) continue;
+            svc = &services[service_count++];
+            memset(svc, 0, sizeof(*svc));
+            snprintf(svc->name, sizeof(svc->name), "%s", name);
+            svc->order = order;
+            svc->levels = (1 << 3) | (1 << 5); /* по умолчанию: консоль и графика */
+            svc->daemon = daemon;
+        }
+        snprintf(svc->start_path, sizeof(svc->start_path), "/etc/init.d/%.170s", n);
+
+        /* <name>.levels: цифры 0-6 задают уровни, на которых сервис нужен */
+        char cfg[256];
+        snprintf(cfg, sizeof(cfg), "/etc/init.d/%s.levels", name);
+        FILE *f = fopen(cfg, "r");
+        if (f) {
+            svc->levels = 0;
+            int ch;
+            while ((ch = fgetc(f)) != EOF) {
+                if (ch >= '0' && ch <= '6') svc->levels |= 1 << (ch - '0');
             }
-
-            char path[512];
-            snprintf(path, sizeof(path), "/etc/init.d/%s", namelist[i]->d_name);
-            if (access(path, X_OK) != 0) continue;
-
-            /* желтый меллстрой */
-            print_status("1;33", "  WAIT  ", namelist[i]->d_name);
-            
-            pid_t pid = fork();
-            if (pid == 0) {
-                if (pass == 0) execl(path, namelist[i]->d_name, "start", (char *)NULL);
-                else execl(path, namelist[i]->d_name, (char *)NULL);
-                _exit(1);
-            }
-            
-            int status;
-            waitpid(pid, &status, 0);
-            
-            /* проверка кода возврата скрипта */
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                print_status("1;32", "   OK   ", namelist[i]->d_name);
-            } else {
-                print_status("1;31", "  FAIL  ", namelist[i]->d_name);
-            }
+            fclose(f);
         }
     }
 
-    for (int i = 0; i < n; i++) free(namelist[i]);
-    free(namelist);
+    /* стоп-скрипты K##-<name> */
+    rewinddir(d);
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        if (n[0] != 'K' || n[1] == '.') continue;
+        int order = 0, daemon = 0;
+        const char *name = service_name_from_file(n, &order, &daemon);
+        struct service *svc = find_service(name);
+        if (!svc) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/etc/init.d/%s", n);
+        if (access(path, X_OK) == 0)
+            snprintf(svc->stop_path, sizeof(svc->stop_path), "/etc/init.d/%.170s", n);
+    }
+    closedir(d);
+
+    qsort(services, service_count, sizeof(struct service), cmp_service);
+    for (int i = 0; i < service_count; i++) {
+        do_log("service %s: %s (levels=%x, %s)\n", services[i].name,
+               services[i].start_path, services[i].levels,
+               services[i].daemon ? "daemon" : "oneshot");
+    }
 }
 
-static void setup_devpts_for(void) {
+static void start_service(struct service *svc) {
+    if (!svc || !svc->start_path[0] || svc->active) return;
+    svc->last_status = -1;
+    print_status("1;33", "  WAIT  ", svc->name);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (svc->daemon) {
+            int fd = open("/var/log/services.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                dup2(fd, STDOUT_FILENO);
+                dup2(fd, STDERR_FILENO);
+                if (fd > 2) close(fd);
+            }
+        }
+        execl(svc->start_path, svc->start_path, "start", (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        print_status("1;31", "  FAIL  ", svc->name);
+        return;
+    }
+
+    if (svc->daemon) {
+        svc->pid = pid;
+        svc->active = 1;
+        svc->last_status = 0;
+        write_pid_file(svc->name, pid);
+        print_status("1;32", "  OK   ", svc->name);
+    } else {
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        svc->last_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        if (svc->last_status == 0) {
+            svc->active = 1;
+            svc->pid = 0;
+            print_status("1;32", "  OK   ", svc->name);
+        } else {
+            print_status("1;31", "  FAIL  ", svc->name);
+            do_log("service %s failed with exit code %d\n", svc->name, svc->last_status);
+        }
+    }
+    update_status_file();
+}
+
+static void stop_service(struct service *svc) {
+    if (!svc || !svc->active) return;
+    if (svc->stop_path[0]) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            execl(svc->stop_path, svc->stop_path, "stop", (char *)NULL);
+            _exit(127);
+        }
+        if (pid > 0) {
+            int status = 0;
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    if (svc->pid > 0) {
+        kill(-svc->pid, SIGTERM);
+        for (int i = 0; i < 20; i++) {
+            if (waitpid(svc->pid, NULL, WNOHANG) == svc->pid) break;
+            usleep(100000);
+        }
+        if (kill(-svc->pid, 0) == 0) {
+            kill(-svc->pid, SIGKILL);
+            waitpid(svc->pid, NULL, 0);
+        }
+        char path[128];
+        snprintf(path, sizeof(path), "/run/%.100s.pid", svc->name);
+        unlink(path);
+    }
+    svc->active = 0;
+    svc->pid = 0;
+    do_log("service %s stopped\n", svc->name);
+    update_status_file();
+}
+
+static void stop_all_services(void) {
+    for (int i = service_count - 1; i >= 0; i--) stop_service(&services[i]);
+}
+
+static void run_services(int runlevel) {
+    for (int i = 0; i < service_count; i++) {
+        if (!(services[i].levels & (1 << runlevel))) continue;
+        if (!services[i].active) start_service(&services[i]);
+    }
+}
+
+static void set_runlevel(int level) {
+    if (level == current_runlevel) return;
+    current_runlevel = level;
+    update_status_file();
+    do_log("runlevel change: %d\n", level);
+
+    if (level == 0 || level == 6) { shutdown_requested = 1; return; }
+    if (level == 1) {
+        kill(-1, SIGTERM);
+        emergency_shell();
+        shutdown_requested = 1;
+        return;
+    }
+    for (int i = service_count - 1; i >= 0; i--) {
+        if (!(services[i].levels & (1 << level))) stop_service(&services[i]);
+    }
+    run_services(level);
+}
+
+static void handle_service_command(const char *cmd) {
+    if (!cmd || !*cmd) return;
+    if (strcmp(cmd, "list") == 0) { update_status_file(); return; }
+
+    char action[16], name[48];
+    if (sscanf(cmd, "%15s %47s", action, name) != 2) {
+        do_log("bad in-service command: %s\n", cmd);
+        return;
+    }
+    struct service *svc = find_service(name);
+    if (!svc) {
+        do_log("unknown service: %s\n", name);
+        return;
+    }
+    if (strcmp(action, "start") == 0) start_service(svc);
+    else if (strcmp(action, "stop") == 0) stop_service(svc);
+    else if (strcmp(action, "restart") == 0) { stop_service(svc); start_service(svc); }
+    else do_log("unknown in-service action: %s\n", action);
+    update_status_file();
+}
+
+static void run_init_scripts(void) {
+    discover_services();
+    run_services(current_runlevel);
+    update_status_file();
+}
+
+static void setup_devpts(void) {
     print_status("1;33", "  WAIT  ", "mounting /dev/pts");
 
     /* создаём точку монтирования если её ещё нет */
@@ -514,6 +781,13 @@ static void update_status_file(void) {
     FILE *f = fopen("/run/init_status", "w");
     if (f) {
         fprintf(f, "PID 1: running\nCurrent Runlevel: %d\n", current_runlevel);
+        fprintf(f, "Services:\n");
+        for (int i = 0; i < service_count; i++) {
+            fprintf(f, "  %-16s %s (exit %d)", services[i].name,
+                    services[i].active ? "active" : "stopped", services[i].last_status);
+            if (services[i].pid > 0) fprintf(f, " (pid %d)", (int)services[i].pid);
+            fprintf(f, "\n");
+        }
         fclose(f);
     }
 }
@@ -555,6 +829,8 @@ static void parse_cmdline(void) {
 
 static void graceful_shutdown(void) {
     printf("\n\033[1;31m*** INITIATING SHUTDOWN SEQUENCE ***\033[0m\n");
+    printf("stopping services...\n");
+    stop_all_services();
     printf("sending SIGTERM to all processes...\n");
     kill(-1, SIGTERM);
     sync(); 
@@ -629,13 +905,13 @@ static void set_env(void) {
 }
 
 static void set_hostname(void) {
-    char hname[256] = "wilix";
+    char hname[256] = "combine";
     FILE *f = fopen("/etc/hostname", "r");
     if (f) {
         if (fgets(hname, sizeof(hname), f)) hname[strcspn(hname, "\r\n")] = 0;
         fclose(f);
     }
-    if (hname[0] == '\0') strcpy(hname, "wilix");
+    if (hname[0] == '\0') strcpy(hname, "combine");
     sethostname(hname, strlen(hname));
 }
 
@@ -688,21 +964,24 @@ static void load_kernel_modules(void) {
         return;
     }
 
-    print_status("1;33", "  WAIT  ", "loading graphics modules");
-    
+    print_status("1;33", "  WAIT  ", "loading kernel modules");
+
     pid_t pid = fork();
     if (pid == 0) {
-        execl("/bin/busybox", "busybox", "modprobe", "-a", "simpledrm", "bochs", "xe", (char *)NULL);
+        /* virtio_pci must come before virtio_net: it is the PCI transport,
+         * virtio_net is only the network driver that binds to it. */
+        execl("/bin/busybox", "busybox", "modprobe", "-a",
+              "bochs", "evdev", "psmouse", "virtio_pci", "virtio_net", "e1000", (char *)NULL);
         _exit(1);
     }
     
     int status;
     waitpid(pid, &status, 0);
-    
+
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        print_status("1;32", "   OK   ", "graphics modules loaded");
+        print_status("1;32", "   OK   ", "kernel modules loaded");
     } else {
-        print_status("1;31", "  FAIL  ", "failed to load graphics modules");
+        print_status("1;31", "  FAIL  ", "failed to load kernel modules");
     }
 }
 
